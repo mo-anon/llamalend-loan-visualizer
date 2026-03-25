@@ -1,0 +1,15 @@
+[project]
+name = "llamalend-loan-visualizer"
+version = "0.1.0"
+description = "Generate time-series chart videos of Curve LLAMMA soft-liquidation loans"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "ffmpeg>=1.4",
+    "matplotlib>=3.10.7",
+    "python-dotenv>=1.2.2",
+    "uvicorn[standard]>=0.34.0",
+    "w3multicall>=0.3.1",
+    "web3>=7.14.0",
+]

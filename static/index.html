@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLAMMA Video</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+    background: #FAFAFA;
+    color: #1d1d1f;
+    padding: 28px 36px;
+    max-width: 1200px;
+    margin: 0 auto;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  /* --- Header --- */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 20px;
+  }
+  h1 { font-size: 18px; font-weight: 600; letter-spacing: -0.02em; }
+  h1 span { color: #888; font-weight: 400; }
+
+  button#generate {
+    padding: 8px 28px;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    color: #fff;
+    background: #3162F4;
+    border: none;
+    cursor: pointer;
+    letter-spacing: 0.02em;
+    transition: opacity 0.15s;
+    flex-shrink: 0;
+  }
+  button#generate:hover { opacity: 0.88; }
+  button#generate:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* --- Form --- */
+  .form-grid {
+    display: grid;
+    grid-template-columns: 2fr 2fr 1fr 1fr 1fr 1fr;
+    gap: 12px 20px;
+    margin-bottom: 12px;
+    align-items: end;
+  }
+  .field { display: flex; flex-direction: column; gap: 3px; }
+  .field label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #888;
+  }
+  .field input {
+    font-family: inherit;
+    font-size: 12px;
+    color: #1d1d1f;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid #ccc;
+    padding: 5px 0;
+    outline: none;
+    transition: border-color 0.15s;
+    min-width: 0;
+  }
+  .field input:focus { border-bottom-color: #3162F4; }
+  .field input::placeholder { color: #bbb; }
+  .field input:disabled {
+    color: #ccc;
+    border-bottom-color: #e8e8e8;
+    cursor: not-allowed;
+  }
+
+  .form-hint {
+    grid-column: 3 / 5;
+    font-size: 10px;
+    color: #aaa;
+    margin-top: -6px;
+  }
+
+  .options-row {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    margin-bottom: 20px;
+  }
+  .checkbox-field {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .checkbox-field input[type="checkbox"] {
+    accent-color: #3162F4;
+    width: 13px;
+    height: 13px;
+  }
+  .checkbox-field label { font-size: 11px; color: #666; }
+
+  .inline-field {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .inline-field label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #888;
+    white-space: nowrap;
+  }
+  .inline-field input {
+    font-family: inherit;
+    font-size: 12px;
+    color: #1d1d1f;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid #ccc;
+    padding: 5px 0;
+    outline: none;
+    width: 220px;
+    transition: border-color 0.15s;
+  }
+  .inline-field input:focus { border-bottom-color: #3162F4; }
+  .inline-field input::placeholder { color: #bbb; }
+
+  /* --- Tooltip --- */
+  .tooltip-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+  }
+  .tooltip-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: 1px solid #bbb;
+    font-size: 9px;
+    color: #999;
+    cursor: default;
+    margin-left: 4px;
+    flex-shrink: 0;
+  }
+  .tooltip-icon:hover { border-color: #888; color: #666; }
+  .tooltip-bubble {
+    display: none;
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: #333;
+    color: #f0f0f0;
+    font-size: 11px;
+    line-height: 1.5;
+    padding: 8px 10px;
+    border-radius: 4px;
+    width: 280px;
+    z-index: 10;
+    pointer-events: none;
+  }
+  .tooltip-wrap:hover .tooltip-bubble { display: block; }
+
+  /* --- Manual events --- */
+  .events-section {
+    margin-bottom: 20px;
+  }
+  .events-section.hidden { display: none; }
+  .events-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .events-header label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #888;
+  }
+  .event-rows { display: flex; flex-direction: column; gap: 6px; }
+  .event-row {
+    display: grid;
+    grid-template-columns: 140px 180px 140px 24px;
+    gap: 10px;
+    align-items: end;
+  }
+  .event-row input, .event-row select {
+    font-family: inherit;
+    font-size: 12px;
+    color: #1d1d1f;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid #ccc;
+    padding: 5px 0;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .event-row input:focus, .event-row select:focus { border-bottom-color: #3162F4; }
+  .event-row input::placeholder { color: #bbb; }
+  .event-row select { cursor: pointer; }
+  .event-row .remove-event {
+    font-size: 14px;
+    color: #bbb;
+    cursor: pointer;
+    border: none;
+    background: none;
+    font-family: inherit;
+    padding: 0;
+    line-height: 1;
+  }
+  .event-row .remove-event:hover { color: #CC0000; }
+  .add-event-btn {
+    font-family: inherit;
+    font-size: 11px;
+    color: #3162F4;
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 4px 0;
+    margin-top: 4px;
+  }
+  .add-event-btn:hover { text-decoration: underline; }
+
+  /* --- Two-panel output --- */
+  .panels {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .panel {
+    border: 1px solid #ddd;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    height: 520px;
+  }
+  .panel-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #888;
+    padding: 8px 12px;
+    border-bottom: 1px solid #ddd;
+    background: #F8F8F6;
+    flex-shrink: 0;
+  }
+
+  /* Video panel */
+  .video-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    overflow: hidden;
+  }
+  #video-placeholder {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #bbb;
+    font-size: 12px;
+    background: #F5F5F2;
+  }
+  #video-placeholder.hidden { display: none; }
+  .spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid #ddd;
+    border-top-color: #3162F4;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+  .spinner.hidden { display: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  #video-content {
+    display: none;
+    flex-direction: column;
+    flex: 1;
+  }
+  #video-content.visible { display: flex; }
+  #video-content video {
+    width: 100%;
+    flex: 1;
+    background: #000;
+    min-height: 0;
+  }
+  .download-bar {
+    padding: 8px 12px;
+    border-top: 1px solid #ddd;
+    flex-shrink: 0;
+  }
+  .download-bar a {
+    font-size: 11px;
+    color: #3162F4;
+    text-decoration: none;
+  }
+  .download-bar a:hover { text-decoration: underline; }
+
+  /* Terminal panel */
+  #terminal {
+    flex: 1;
+    background: #F5F5F0;
+    padding: 12px 14px;
+    font-size: 11px;
+    line-height: 1.65;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  #terminal .line { color: #333; }
+  #terminal .line::before { content: "$ "; color: #aaa; }
+  #terminal .error { color: #CC0000; }
+  #terminal .error::before { content: "! "; color: #CC0000; }
+  #terminal .done { color: #2E7D32; font-weight: 600; }
+  #terminal .done::before { content: ""; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>LLAMMA Video <span>/ generate</span></h1>
+  <button id="generate">Generate</button>
+</div>
+
+<div class="form-grid">
+  <div class="field">
+    <label>Controller Address</label>
+    <input type="text" id="controller" value="0x4f79fe450a2baf833e8f50340bd230f5a3ecafe9" placeholder="0x...">
+  </div>
+  <div class="field">
+    <label>User Address</label>
+    <input type="text" id="user" value="0x99AC3e98670a6EF21acb03072Ff1D8f448033794" placeholder="0x...">
+  </div>
+  <div class="field">
+    <label>Start Block</label>
+    <input type="text" id="start_block" value="24378883" placeholder="block or datetime">
+  </div>
+  <div class="field">
+    <label>End Block</label>
+    <input type="text" id="end_block" value="" placeholder="block or datetime">
+  </div>
+  <div class="field">
+    <label>Duration</label>
+    <input type="number" id="duration" value="100" placeholder="blocks">
+  </div>
+  <div class="field">
+    <label>Step</label>
+    <input type="number" id="block_step" value="5" min="1">
+  </div>
+  <div></div><div></div>
+  <div class="form-hint">Block number or UTC datetime (DD/MM/YYYY HH:MM:SS)</div>
+</div>
+
+<div class="options-row">
+  <div class="checkbox-field">
+    <input type="checkbox" id="auto_events" checked>
+    <label for="auto_events">Auto-fetch events</label>
+    <div class="tooltip-wrap">
+      <span class="tooltip-icon">?</span>
+      <div class="tooltip-bubble">
+        When enabled, loan events (borrow, repay, liquidation, etc.) are automatically fetched from the Curve Prices API and marked on the chart. Disable to manually specify events instead.
+      </div>
+    </div>
+  </div>
+  <div class="inline-field">
+    <label for="rpc_url">RPC URL</label>
+    <input type="text" id="rpc_url" value="" placeholder="uses .env if empty">
+  </div>
+  <div class="inline-field">
+    <label for="etherscan_key">Etherscan Key</label>
+    <input type="text" id="etherscan_key" value="" placeholder="uses .env if empty">
+  </div>
+</div>
+
+<div class="events-section hidden" id="manual-events-section">
+  <div class="events-header">
+    <label>Manual Events</label>
+    <div class="tooltip-wrap">
+      <span class="tooltip-icon">?</span>
+      <div class="tooltip-bubble">
+        Add events manually to mark on the chart. Each event needs a block number, an action type, and an optional amount.
+      </div>
+    </div>
+  </div>
+  <div class="event-rows" id="event-rows"></div>
+  <button class="add-event-btn" id="add-event-btn">+ Add event</button>
+</div>
+
+<div class="panels">
+  <div class="panel">
+    <div class="panel-label">Video</div>
+    <div class="video-body">
+      <div id="video-placeholder">
+        <span><span id="placeholder-spinner" class="spinner hidden"></span><span id="placeholder-text">Press Generate to start</span></span>
+      </div>
+      <div id="video-content">
+        <video id="player" controls></video>
+        <div class="download-bar">
+          <a id="download-link" href="#" download="video.mp4">Download MP4</a>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-label">Console</div>
+    <div id="terminal"></div>
+  </div>
+</div>
+
+<script>
+const btn = document.getElementById('generate');
+const terminal = document.getElementById('terminal');
+const placeholder = document.getElementById('video-placeholder');
+const placeholderSpinner = document.getElementById('placeholder-spinner');
+const placeholderText = document.getElementById('placeholder-text');
+const videoContent = document.getElementById('video-content');
+const player = document.getElementById('player');
+const downloadLink = document.getElementById('download-link');
+
+const startInput = document.getElementById('start_block');
+const endInput = document.getElementById('end_block');
+const durationInput = document.getElementById('duration');
+const autoEventsCheckbox = document.getElementById('auto_events');
+const manualEventsSection = document.getElementById('manual-events-section');
+const eventRowsContainer = document.getElementById('event-rows');
+const addEventBtn = document.getElementById('add-event-btn');
+
+const EVENT_ACTIONS = [
+  'borrow', 'repay_debt', 'add_collateral', 'remove_collateral', 'closed', 'liquidated'
+];
+
+function toggleManualEvents() {
+  if (autoEventsCheckbox.checked) {
+    manualEventsSection.classList.add('hidden');
+  } else {
+    manualEventsSection.classList.remove('hidden');
+    if (eventRowsContainer.children.length === 0) addEventRow();
+  }
+}
+
+function addEventRow() {
+  const row = document.createElement('div');
+  row.className = 'event-row';
+  const options = EVENT_ACTIONS.map(a =>
+    `<option value="${a}">${a.replace(/_/g, ' ')}</option>`
+  ).join('');
+  row.innerHTML = `
+    <input type="number" class="evt-block" placeholder="Block number">
+    <select class="evt-action">${options}</select>
+    <input type="number" class="evt-amount" placeholder="Amount (optional)" step="any">
+    <button class="remove-event" title="Remove">&times;</button>
+  `;
+  row.querySelector('.remove-event').addEventListener('click', () => {
+    row.remove();
+    if (eventRowsContainer.children.length === 0) addEventRow();
+  });
+  eventRowsContainer.appendChild(row);
+}
+
+function collectManualEvents() {
+  const events = [];
+  for (const row of eventRowsContainer.children) {
+    const block = parseInt(row.querySelector('.evt-block').value);
+    const action = row.querySelector('.evt-action').value;
+    const amount = parseFloat(row.querySelector('.evt-amount').value) || 0;
+    if (!isNaN(block) && block > 0) {
+      events.push({ blocknumber: block, action, amount });
+    }
+  }
+  return events;
+}
+
+autoEventsCheckbox.addEventListener('change', toggleManualEvents);
+addEventBtn.addEventListener('click', addEventRow);
+toggleManualEvents();
+
+function parseBlockInput(input) {
+  if (input.disabled) return null;
+  const val = input.value.trim();
+  if (!val) return null;
+  const n = Number(val);
+  if (!isNaN(n) && Number.isInteger(n)) return n;
+  return val;
+}
+
+// When two of Start/End/Duration are filled, disable the third.
+function enforceBlockRange() {
+  const hasStart = startInput.value.trim() !== '';
+  const hasEnd = endInput.value.trim() !== '';
+  const hasDuration = durationInput.value.trim() !== '';
+
+  startInput.disabled = false;
+  endInput.disabled = false;
+  durationInput.disabled = false;
+
+  if (hasStart && hasEnd) {
+    durationInput.disabled = true;
+  } else if (hasStart && hasDuration) {
+    endInput.disabled = true;
+  } else if (hasEnd && hasDuration) {
+    startInput.disabled = true;
+  }
+}
+
+startInput.addEventListener('input', enforceBlockRange);
+endInput.addEventListener('input', enforceBlockRange);
+durationInput.addEventListener('input', enforceBlockRange);
+enforceBlockRange(); // apply on load
+
+btn.addEventListener('click', async () => {
+  btn.disabled = true;
+  terminal.innerHTML = '';
+
+  // Show spinner placeholder, hide video
+  placeholderSpinner.classList.remove('hidden');
+  placeholderText.textContent = 'Generating video...';
+  placeholder.classList.remove('hidden');
+  videoContent.classList.remove('visible');
+
+  const autoFetch = autoEventsCheckbox.checked;
+  const body = {
+    controller_address: document.getElementById('controller').value.trim(),
+    user_address: document.getElementById('user').value.trim(),
+    start_block: parseBlockInput(startInput),
+    end_block: parseBlockInput(endInput),
+    duration: durationInput.disabled ? null : (durationInput.value ? parseInt(durationInput.value) : null),
+    block_step: parseInt(document.getElementById('block_step').value) || 5,
+    auto_fetch_events: autoFetch,
+    events: autoFetch ? [] : collectManualEvents(),
+    rpc_url: document.getElementById('rpc_url').value.trim() || null,
+    etherscan_api_key: document.getElementById('etherscan_key').value.trim() || null,
+  };
+
+  let jobId;
+  try {
+    const res = await fetch('/api/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      appendLine(err.detail || 'Failed to start job', 'error');
+      btn.disabled = false;
+      return;
+    }
+    const data = await res.json();
+    jobId = data.job_id;
+  } catch (e) {
+    appendLine('Network error: ' + e.message, 'error');
+    btn.disabled = false;
+    return;
+  }
+
+  const evtSource = new EventSource('/api/stream/' + jobId);
+
+  evtSource.addEventListener('log', (e) => {
+    appendLine(e.data);
+  });
+
+  evtSource.addEventListener('done', (e) => {
+    appendLine('Pipeline complete.', 'done');
+    evtSource.close();
+    btn.disabled = false;
+    const videoUrl = '/api/video/' + jobId;
+    const filename = e.data || 'video.mp4';
+    player.src = videoUrl;
+    downloadLink.href = videoUrl;
+    downloadLink.download = filename;
+    placeholder.classList.add('hidden');
+    videoContent.classList.add('visible');
+  });
+
+  evtSource.addEventListener('error', (e) => {
+    if (e.data) {
+      appendLine('ERROR: ' + e.data, 'error');
+    }
+    evtSource.close();
+    btn.disabled = false;
+    placeholderSpinner.classList.add('hidden');
+    placeholderText.textContent = 'Error — check console';
+  });
+
+  evtSource.onerror = () => {
+    evtSource.close();
+    btn.disabled = false;
+  };
+});
+
+function appendLine(text, cls) {
+  const div = document.createElement('div');
+  div.className = cls || 'line';
+  div.textContent = text;
+  terminal.appendChild(div);
+  terminal.scrollTop = terminal.scrollHeight;
+}
+</script>
+</body>
+</html>
