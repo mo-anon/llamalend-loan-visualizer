@@ -541,6 +541,7 @@ def run_pipeline(config: PipelineConfig, log_fn=print) -> Path:
         "block_step": block_step,
         "num_frames": len(all_block_data),
         "generated": str(date.today()),
+        "events": events,
         "blocks": all_block_data,
     }
     with data_filename.open("w") as f:
