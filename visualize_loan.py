@@ -14,6 +14,7 @@ Usage:
   uv run python visualize_loan.py
 """
 
+import concurrent.futures
 import json
 import shutil
 import subprocess
@@ -23,6 +24,8 @@ from datetime import date
 from pathlib import Path
 from typing import Union
 
+import numpy as np
+
 import matplotlib
 matplotlib.use('Agg')  # non-GUI backend — no window, faster saves
 import matplotlib.pyplot as plt
@@ -30,6 +33,7 @@ import matplotlib.ticker as mticker
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib import font_manager, rcParams
+from web3 import Web3
 from web3.exceptions import ContractLogicError, BlockNotFound
 
 from llamma_loan import (
@@ -49,10 +53,10 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # Curve lending controller address — the AMM (LLAMMA) address is derived
 # automatically by calling controller.amm() on-chain.
-CONTROLLER_ADDRESS = "0x7443944962D04720f8c220C0D25f56F869d6EfD4"
+CONTROLLER_ADDRESS = "0xEdA215b7666936DEd834f76f3fBC6F323295110A"
 
 # Borrower address to track
-USER_ADDRESS = "0x7a16ff8270133f063aab6c9977183d9e72835428"
+USER_ADDRESS = "0x9F2F1E3dedEeA341c479d3bD5D5775De4448d8Bb"
 
 # Where to write output (gitignored)
 OUTPUT_BASE = BASE_DIR / "output"
@@ -80,16 +84,17 @@ OUTPUT_BASE = BASE_DIR / "output"
 #   - None   → latest block (END_BLOCK) / derive from DURATION (START_BLOCK)
 #
 # Datetime strings require ETHERSCAN_API_KEY in .env (free at etherscan.io).
-START_BLOCK = 19291399
-END_BLOCK = 19417362
+START_BLOCK =24343202
+END_BLOCK = 24741632
 DURATION = None
-BLOCK_STEP = 200  # sample every Nth block — lower = more frames, smoother video
+BLOCK_STEP = 500  # sample every Nth block — lower = more frames, smoother video
+MAX_WORKERS = 6   # parallel RPC fetchers — set to 1 to disable parallelism
 
 
 # Events to mark on the chart — vertical lines + info panel.
 # Set AUTO_FETCH_EVENTS=True to auto-fetch from the Curve Prices API.
 # If EVENTS is non-empty it is used as-is regardless of AUTO_FETCH_EVENTS.
-AUTO_FETCH_EVENTS = False
+AUTO_FETCH_EVENTS = True
 EVENTS = []
 
 
@@ -147,11 +152,29 @@ class PipelineConfig:
     output_base: Path | None = None
     etherscan_api_key: str | None = None
     rpc_url: str | None = None
+    max_workers: int = 8
 
 
 # =============================================================================
 # Helper functions
 # =============================================================================
+
+_BAR_CHARS = " ▏▎▍▌▋▊▉█"
+
+def _progress_bar(current: int, total: int, width: int = 30) -> str:
+    """Return a smooth text progress bar using partial-fill characters."""
+    pct = current / total if total > 0 else 0
+    full_width = pct * width
+    filled = int(full_width)
+    frac = full_width - filled
+    partial = _BAR_CHARS[int(frac * 8)]
+    empty = width - filled - 1
+    if filled >= width:
+        bar = "█" * width
+    else:
+        bar = "█" * filled + partial + " " * max(empty, 0)
+    return f"▐{bar}▌ {pct * 100:5.1f}%"
+
 
 def get_event_style(action: str) -> dict:
     """Return plotting style for an event action with sensible defaults."""
@@ -184,6 +207,67 @@ def get_health_color(health_val):
         return f"#{r:02X}{g:02X}{b:02X}", f"#{int(r*0.8):02X}{int(g*0.8):02X}{int(b*0.8):02X}"
     else:
         return "#4CAF50", "#2E7D32"
+
+
+def _hex_to_rgba(hex_color, alpha=0.6):
+    """Convert a hex color string to an RGBA tuple (0-1 floats)."""
+    h = hex_color.lstrip('#')
+    return (int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255, alpha)
+
+
+def _fill_band_column(img, col, bands, y_min, y_max, chart_colors):
+    """Fill one column of the bands image array for a single frame.
+
+    This replaces per-frame barh() calls with direct pixel writes into a
+    numpy RGBA array, which is then displayed via a single imshow artist
+    that is updated with set_data() each frame — O(1) instead of O(N).
+    """
+    h = img.shape[0]
+    scale = h / (y_max - y_min)
+
+    coll_fill = _hex_to_rgba(chart_colors['collateral']['fill'], 0.6)
+    coll_edge = _hex_to_rgba(chart_colors['collateral']['edge'], 0.8)
+    crvusd_fill = _hex_to_rgba(chart_colors['crvusd']['fill'], 0.6)
+    crvusd_edge = _hex_to_rgba(chart_colors['crvusd']['edge'], 0.8)
+
+    for band in bands:
+        min_p = band['min_price']
+        max_p = band['max_price']
+        crvusd_amount = band['crvusd_amount']
+        collateral_val = band['collateral_as_crvusd']
+        total_val = band.get('band_total_value', band['total_collateral_value'])
+
+        if total_val <= 0:
+            continue
+
+        # Map prices to pixel rows (row 0 = y_max = top of image)
+        top_row = max(0, int((y_max - max_p) * scale))
+        bot_row = min(h, int((y_max - min_p) * scale))
+
+        if top_row >= bot_row:
+            continue
+
+        if collateral_val > 0 and crvusd_amount > 0:
+            coll_pct = collateral_val / total_val
+            # Collateral at bottom (higher row indices), crvUSD at top
+            split_row = bot_row - int((bot_row - top_row) * coll_pct)
+            img[top_row:split_row, col] = crvusd_fill
+            img[split_row:bot_row, col] = coll_fill
+            # Edge lines at boundaries
+            if bot_row - top_row >= 3:
+                img[top_row, col] = crvusd_edge
+                img[split_row, col] = coll_edge
+                img[bot_row - 1, col] = coll_edge
+        elif collateral_val > 0:
+            img[top_row:bot_row, col] = coll_fill
+            if bot_row - top_row >= 3:
+                img[top_row, col] = coll_edge
+                img[bot_row - 1, col] = coll_edge
+        elif crvusd_amount > 0:
+            img[top_row:bot_row, col] = crvusd_fill
+            if bot_row - top_row >= 3:
+                img[top_row, col] = crvusd_edge
+                img[bot_row - 1, col] = crvusd_edge
 
 
 def _draw_band_strip(ax, left_pos, bar_width, band, chart_colors):
@@ -346,11 +430,6 @@ def run_pipeline(config: PipelineConfig, log_fn=print) -> Path:
     log_fn("FIRST PASS: Fetching all data from blockchain...")
     log_fn("=" * 60)
 
-    all_block_data = []   # one dict per sampled block
-    all_prices = []       # oracle + band prices, for computing y-axis range
-    all_band_nums = set() # unique band numbers across all blocks
-    all_health_values = []
-
     # If there's a "closed" or "liquidated" event, stop fetching after it
     close_loan_block = None
     for event in events:
@@ -358,99 +437,85 @@ def run_pipeline(config: PipelineConfig, log_fn=print) -> Path:
             close_loan_block = event['blocknumber']
             break
 
-    start_time = time.time()
-    cycle = 0
-
+    # Pre-compute list of blocks to fetch
+    blocks_to_fetch = []
     for block in range(start_block, end_block + 1, block_step):
         if close_loan_block is not None and block > close_loan_block:
-            log_fn(f"\n  Block {block} is after close loan event block {close_loan_block}. Stopping.")
             break
+        blocks_to_fetch.append(block)
 
-        cycle += 1
-        if cycle == 1:
-            fetch_start_time = time.time()
-        else:
-            elapsed_time = time.time() - fetch_start_time
-            blocks_processed = cycle - 1
-            blocks_remaining = num_blocks - cycle + 1
-            estimated_time_remaining = (elapsed_time / blocks_processed) * blocks_remaining
-            log_fn(f"Fetching block {block} ({cycle}/{num_blocks}) "
-                   f"| ETA: {estimated_time_remaining:.1f}s")
+    num_blocks_to_fetch = len(blocks_to_fetch)
 
-        try:
-            # Multicall: oracle price, band balances, health, debt, user_state
-            loan.get_block_vars(block_number=block)
-            bands = loan.find_user_bands()
-            price_oracle = loan.price_oracle / 1e18
-            health = loan.health_full / PRECISION * 100
+    # Create separate Web3 instances per RPC URL so load is distributed
+    # from the start (not via failover-switching, which is chaotic under
+    # heavy parallel load).
+    w3_pool = [Web3(Web3.HTTPProvider(url)) for url in rpc.urls]
+    max_workers = min(config.max_workers, len(w3_pool) * 2)
+    log_fn(f"  Fetching {num_blocks_to_fetch} blocks with {max_workers} workers "
+           f"across {len(w3_pool)} RPCs...")
 
-            # Prefer controller.user_state for debt/collateral breakdown
-            debt = loan.debt / PRECISION
-            collateral_native = 0
-            collateral_crvusd = 0
-            num_bands_state = len(bands)
-            if hasattr(loan, "user_state") and loan.user_state:
-                try:
-                    us = loan.user_state  # [collateral, crvusd, debt, N]
-                    collateral_native = us[0] / (10 ** loan.coins[1]['decimals'])
-                    collateral_crvusd = us[1] / 1e18
-                    debt = us[2] / 1e18
-                    if isinstance(us[3], int):
-                        num_bands_state = len(bands)
-                except Exception:
-                    pass
+    start_time = time.time()
+    all_block_data = []
+    completed_count = 0
+    log_interval = max(1, num_blocks_to_fetch // 50)
 
-            total_collateral_value = collateral_native * price_oracle + collateral_crvusd
+    def _fetch_one(block_and_w3):
+        block, w3 = block_and_w3
+        return loan.fetch_block_data(block, w3=w3)
 
-            # Fallback: sum band values if user_state returned zero
-            if total_collateral_value == 0 and bands:
-                band_collateral_value = sum(b.get('collateral_as_crvusd', 0) for b in bands)
-                band_crvusd_value = sum(b.get('crvusd_amount', 0) for b in bands)
-                total_collateral_value = band_collateral_value + band_crvusd_value
-                collateral_crvusd = band_crvusd_value
+    # Round-robin assign blocks to Web3 instances
+    block_assignments = [
+        (b, w3_pool[i % len(w3_pool)])
+        for i, b in enumerate(blocks_to_fetch)
+    ]
 
-            all_block_data.append({
-                'block': block,
-                'block_date': loan.block_date,
-                'price_oracle': price_oracle,
-                'health': health,
-                'get_base_price': loan.get_base_price,
-                'A': loan.A,
-                'bands': bands,
-                'debt': debt,
-                'total_collateral_value': total_collateral_value,
-                'collateral_native': collateral_native,
-                'collateral_crvusd': collateral_crvusd,
-                'num_bands_state': num_bands_state,
-            })
-        except BlockNotFound as e:
-            log_fn(f"\n  Block {block} not found (future block?). Stopping.")
-            log_fn(f"  Error: {str(e)[:200]}")
-            break
-        except ContractLogicError as e:
-            error_msg = str(e)
-            if 'Multicall3: call failed' in error_msg or 'execution reverted' in error_msg:
-                log_fn(f"\n  Contract call failed at block {block} (loan closed?). Stopping.")
-                log_fn(f"  Error: {error_msg[:200]}")
-                break
-            else:
-                raise
-        except Exception as e:
-            if close_loan_block is not None and block >= close_loan_block:
-                log_fn(f"\n  Error at block {block} (close loan event at {close_loan_block}). Stopping.")
-                log_fn(f"  Error: {str(e)[:200]}")
-                break
-            else:
-                raise
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_block = {
+            executor.submit(_fetch_one, pair): pair[0]
+            for pair in block_assignments
+        }
 
-        if close_loan_block is not None and block >= close_loan_block:
-            log_fn(f"\n  Reached close loan event block {close_loan_block}. Stopping.")
-            break
+        for future in concurrent.futures.as_completed(future_to_block):
+            block = future_to_block[future]
+            completed_count += 1
 
-        # Accumulate price/band/health ranges for axis scaling
-        all_prices.append(price_oracle)
-        all_health_values.append(health)
-        for band in bands:
+            try:
+                data = future.result()
+                all_block_data.append(data)
+            except BlockNotFound:
+                log_fn(f"  Block {block} not found (future block?). Skipping.")
+            except ContractLogicError as e:
+                error_msg = str(e)
+                if 'Multicall3: call failed' in error_msg or 'execution reverted' in error_msg:
+                    log_fn(f"  Contract call failed at block {block} (loan closed?). Skipping.")
+                else:
+                    raise
+            except Exception as e:
+                if close_loan_block is not None and block >= close_loan_block:
+                    log_fn(f"  Error at block {block} near close event. Skipping.")
+                else:
+                    raise
+
+            if (completed_count == 1
+                    or completed_count == num_blocks_to_fetch
+                    or completed_count % log_interval == 0):
+                elapsed = time.time() - start_time
+                eta = (elapsed / completed_count) * (num_blocks_to_fetch - completed_count)
+                log_fn(f"{_progress_bar(completed_count, num_blocks_to_fetch)} "
+                       f"| Fetched {completed_count}/{num_blocks_to_fetch} blocks "
+                       f"| ETA: {eta:.1f}s")
+
+    # Sort by block number (futures complete out of order)
+    all_block_data.sort(key=lambda d: d['block'])
+
+    # Accumulate price/band/health ranges for axis scaling
+    all_prices = []
+    all_band_nums = set()
+    all_health_values = []
+    for bd in all_block_data:
+        all_prices.append(bd['price_oracle'])
+        all_health_values.append(bd['health'])
+        for band in bd['bands']:
             all_prices.append(band['min_price'])
             all_prices.append(band['max_price'])
             all_band_nums.add(band['band_num'])
@@ -460,8 +525,22 @@ def run_pipeline(config: PipelineConfig, log_fn=print) -> Path:
 
     # Save cached block data so re-rendering doesn't require re-fetching
     data_filename = run_dir / "block_data.json"
+    block_data_output = {
+        "controller_address": config.controller_address,
+        "llamma_address": loan.llamma_address,
+        "user_address": config.user_address,
+        "market": market_label,
+        "base_symbol": base_symbol,
+        "collateral_symbol": collateral_symbol,
+        "start_block": start_block,
+        "end_block": end_block,
+        "block_step": block_step,
+        "num_frames": len(all_block_data),
+        "generated": str(date.today()),
+        "blocks": all_block_data,
+    }
     with data_filename.open("w") as f:
-        json.dump(all_block_data, f, indent=2, default=str)
+        json.dump(block_data_output, f, indent=2, default=str)
     log_fn(f"  Saved block data to {data_filename}")
 
     # --- 4. Compute fixed axis ranges (consistent across all frames) --------
@@ -622,6 +701,15 @@ def run_pipeline(config: PipelineConfig, log_fn=print) -> Path:
 
     fig.tight_layout(rect=[0.03, 0.02, 0.98, 0.97])
 
+    # Bands image: numpy RGBA array rendered via imshow instead of accumulating
+    # barh artists.  Each frame fills one column — O(1) per frame, not O(N).
+    bands_pixel_h = 600
+    bands_image = np.zeros((bands_pixel_h, len(all_block_data), 4), dtype=np.float32)
+    bands_im = ax_main.imshow(
+        bands_image, extent=[0, len(all_block_data), y_min, y_max],
+        aspect='auto', origin='upper', interpolation='nearest', zorder=0,
+    )
+
     # Track which events have been drawn (they persist on ax_main once added)
     plotted_event_indices = set()
     max_band_idx = close_loan_block_index if close_loan_block_index is not None else len(all_block_data)
@@ -630,13 +718,15 @@ def run_pipeline(config: PipelineConfig, log_fn=print) -> Path:
         cycle = idx + 1
         block = block_data['block']
 
-        if cycle > 1:
-            elapsed_time = time.time() - image_start_time
-            images_processed = cycle - 1
-            images_remaining = len(all_block_data) - cycle + 1
-            estimated_time_remaining = (elapsed_time / images_processed) * images_remaining
-            log_fn(f"Generating image {cycle}/{len(all_block_data)} (block {block}) "
-                   f"| ETA: {estimated_time_remaining:.1f}s")
+        total_images = len(all_block_data)
+        render_interval = max(1, total_images // 50)
+        if cycle == 1 or cycle == total_images or cycle % render_interval == 0:
+            if cycle == 1:
+                log_fn(f"{_progress_bar(0, total_images)} | Rendering frame 1/{total_images} (block {block})")
+            else:
+                elapsed_time = time.time() - image_start_time
+                eta = (elapsed_time / (cycle - 1)) * (total_images - cycle + 1)
+                log_fn(f"{_progress_bar(cycle, total_images)} | Rendering frame {cycle}/{total_images} (block {block}) | ETA: {eta:.1f}s")
 
         if close_loan_block_index is not None and idx == close_loan_block_index:
             event_type = "liquidation" if any(e.get('action') == 'liquidated' for e in events if e.get('blocknumber') == block) else "close loan"
@@ -653,10 +743,10 @@ def run_pipeline(config: PipelineConfig, log_fn=print) -> Path:
         price_history.append(price_oracle)
         time_indices.append(idx)
 
-        # Band strips: draw only THIS frame's column (previous ones persist)
+        # Band strips: fill one column of the numpy image array (O(1) per frame)
         if idx < max_band_idx:
-            for band in bands:
-                _draw_band_strip(ax_main, idx, 1, band, CHART_COLORS)
+            _fill_band_column(bands_image, idx, bands, y_min, y_max, CHART_COLORS)
+            bands_im.set_data(bands_image)
 
         # Price line: update full history
         price_line.set_data(time_indices, price_history)
@@ -810,5 +900,6 @@ if __name__ == "__main__":
         auto_fetch_events=AUTO_FETCH_EVENTS,
         events=EVENTS,
         output_base=OUTPUT_BASE,
+        max_workers=MAX_WORKERS,
     )
     run_pipeline(config)
