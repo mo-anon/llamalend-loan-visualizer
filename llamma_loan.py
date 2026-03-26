@@ -697,5 +697,15 @@ def fetch_events(controller_address: str, user_address: str, w3: Web3,
         log_fn(f"    {action:<20} block {block_number}  amount {amount:,.2f}")
 
     results.sort(key=lambda e: e["blocknumber"])
+
+    # Detect loan creation: a "borrow" is a creation if it's the first event
+    # or if the previous event closed/liquidated the loan.
+    for i, event in enumerate(results):
+        if event["action"] != "borrow":
+            continue
+        if i == 0 or results[i - 1]["action"] in ("closed", "liquidated"):
+            event["action"] = "loan_created"
+            log_fn(f"    ^ Marking block {event['blocknumber']} as loan creation")
+
     log_fn(f"  Resolved {len(results)} events.")
     return results

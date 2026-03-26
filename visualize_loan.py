@@ -103,6 +103,7 @@ EVENTS = []
 # =============================================================================
 
 EVENT_LABELS = {
+    "loan_created": "Loan Created",
     "repay_debt": "Repayment",
     "borrow": "Borrow",
     "add_collateral": "Add Collateral",
@@ -111,6 +112,7 @@ EVENT_LABELS = {
     "liquidated": "Liquidated",
 }
 EVENT_ICONS = {
+    "loan_created": "★",
     "repay_debt": "↩",
     "add_collateral": "➕",
     "remove_collateral": "➖",
@@ -118,6 +120,7 @@ EVENT_ICONS = {
     "liquidated": "✖",
 }
 EVENT_STYLE = {
+    "loan_created": {"color": "#1E90FF", "linestyle": "--", "linewidth": 1.2},
     "repay_debt": {"color": "#00FF00", "linestyle": ":", "linewidth": 1.0},
     "borrow": {"color": "#1E90FF", "linestyle": ":", "linewidth": 1.0},
     "borrow_debt": {"color": "#1E90FF", "linestyle": ":", "linewidth": 1.0},
@@ -333,10 +336,11 @@ def _fmt_event_line(event, event_data):
     action = event.get('action', 'event')
     block_num = event.get('blocknumber', 0)
 
-    if action == 'closed':
-        label = "loan closed"
+    if action in ('closed', 'loan_created'):
+        label = EVENT_LABELS.get(action, action.replace('_', ' ').title())
         icon = EVENT_ICONS.get(action, '•')
-        amount_text = "-"
+        amount = event.get('amount', 0.0)
+        amount_text = f"{amount:>14,.2f}" if action == 'loan_created' else "-"
         health_text = "-"
     else:
         label = EVENT_LABELS.get(action, action.replace('_', ' ').title())
@@ -656,27 +660,17 @@ def run_pipeline(config: PipelineConfig, log_fn=print) -> Path:
     price_line, = ax_main.plot([], [], color="#3162F4", linestyle='-', linewidth=2.5,
                                marker='o', markersize=2, alpha=0.8)
 
-    # Legend — built once upfront (includes all event types from events)
-    legend_handles = [
+    # Legend — base entries added now; event entries added dynamically as they appear
+    base_legend_handles = [
         Line2D([], [], color="#3162F4", linewidth=2.5, marker='o', markersize=2, alpha=0.8),
         Patch(facecolor=CHART_COLORS['collateral']['fill'], edgecolor=CHART_COLORS['collateral']['edge'], alpha=0.6),
         Patch(facecolor=CHART_COLORS['crvusd']['fill'], edgecolor=CHART_COLORS['crvusd']['edge'], alpha=0.6),
     ]
-    legend_labels = ["Oracle Price", f"Collateral {collateral_symbol}", f"Collateral {base_symbol}"]
-    if events:
-        seen_actions = set()
-        for event in events:
-            action = event.get('action')
-            if action in {'closed', 'liquidated'} or action in seen_actions:
-                continue
-            seen_actions.add(action)
-            label = EVENT_LABELS.get(action, action.replace('_', ' ').title())
-            style = get_event_style(action)
-            legend_handles.append(Line2D([], [], color=style["color"],
-                                        linestyle=style["linestyle"],
-                                        linewidth=style["linewidth"], alpha=0.8))
-            legend_labels.append(label)
-    ax_main.legend(legend_handles, legend_labels, loc='upper left')
+    base_legend_labels = ["Oracle Price", f"Collateral {collateral_symbol}", f"Collateral {base_symbol}"]
+    legend_seen_actions = set()
+    event_legend_handles = []
+    event_legend_labels = []
+    ax_main.legend(base_legend_handles, base_legend_labels, loc='upper left')
 
     # Health axis
     ax_health.set_xlim(-0.8, 0.8)
@@ -765,22 +759,29 @@ def run_pipeline(config: PipelineConfig, log_fn=print) -> Path:
                 for event_data in event_list:
                     event = event_data['event']
                     action = event.get('action')
-                    if action in ['closed', 'liquidated']:
-                        closed_price = price_history[event_idx] if event_idx < len(price_history) else price_history[-1]
-                        is_liquidation = action == 'liquidated'
-                        marker_color = '#FF0000'
-                        marker_style = 'X' if is_liquidation else 'o'
-                        marker_size = 8 if is_liquidation else 7
-                        event_text = 'liquidated' if is_liquidation else 'loan closed'
+                    if action in ['closed', 'liquidated', 'loan_created']:
+                        event_price = price_history[event_idx] if event_idx < len(price_history) else price_history[-1]
+                        if action == 'liquidated':
+                            marker_color, marker_style, marker_size = '#FF0000', 'X', 8
+                            event_text = 'liquidated'
+                            edge_width = 1.5
+                        elif action == 'closed':
+                            marker_color, marker_style, marker_size = '#FF0000', 'o', 7
+                            event_text = 'loan closed'
+                            edge_width = 1
+                        else:  # loan_created
+                            marker_color, marker_style, marker_size = '#1E90FF', 'D', 7
+                            event_text = 'loan created'
+                            edge_width = 1
 
                         ax_main.plot(
-                            event_idx, closed_price, marker_style,
+                            event_idx, event_price, marker_style,
                             color=marker_color, markersize=marker_size,
                             markeredgecolor=marker_color,
-                            markeredgewidth=1.5 if is_liquidation else 1,
+                            markeredgewidth=edge_width,
                             zorder=10, label="_nolegend_")
                         ax_main.text(
-                            event_idx, closed_price + (y_max - y_min) * 0.05,
+                            event_idx, event_price + (y_max - y_min) * 0.05,
                             event_text, fontsize=8, color=marker_color,
                             fontweight='bold', ha='center', va='bottom', zorder=6,
                             bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
@@ -792,6 +793,21 @@ def run_pipeline(config: PipelineConfig, log_fn=print) -> Path:
                             linestyle=style["linestyle"],
                             linewidth=style["linewidth"],
                             alpha=0.6, zorder=2)
+
+                    # Add to legend dynamically on first occurrence
+                    if action not in legend_seen_actions and action not in {'closed', 'liquidated', 'loan_created'}:
+                        legend_seen_actions.add(action)
+                        label = EVENT_LABELS.get(action, action.replace('_', ' ').title())
+                        style = get_event_style(action)
+                        event_legend_handles.append(
+                            Line2D([], [], color=style["color"],
+                                   linestyle=style["linestyle"],
+                                   linewidth=style["linewidth"], alpha=0.8))
+                        event_legend_labels.append(label)
+                        ax_main.legend(
+                            base_legend_handles + event_legend_handles,
+                            base_legend_labels + event_legend_labels,
+                            loc='upper left')
 
             # Event log panel (bottom-left) — shows last 5 events
             event_lines = []
