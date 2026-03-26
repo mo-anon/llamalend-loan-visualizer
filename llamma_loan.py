@@ -7,6 +7,8 @@ querying on-chain loan state, and supporting utilities.
 
 import json
 import os
+import random
+import threading
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -137,6 +139,7 @@ class RPCManager:
 
     def __init__(self, log_fn=print, rpc_url: str | None = None):
         self.log_fn = log_fn
+        self._lock = threading.Lock()
         self.urls: list[str] = []
         if rpc_url:
             self.urls.append(rpc_url)
@@ -161,16 +164,21 @@ class RPCManager:
         return self._w3
 
     def switch(self) -> Web3:
-        """Advance to the next RPC URL and return the new Web3 instance."""
-        if len(self.urls) < 2:
-            raise RuntimeError("Only one RPC URL configured; cannot switch.")
-        self._index = (self._index + 1) % len(self.urls)
-        url = self.urls[self._index]
-        self.log_fn(f"\n⚠️  Switching to RPC URL {self._index + 1}/{len(self.urls)}: {url[:50]}...")
-        self._w3 = Web3(Web3.HTTPProvider(url))
-        if not self._w3.is_connected():
-            raise ConnectionError(f"Failed to connect to RPC URL {self._index + 1}")
-        return self._w3
+        """Advance to the next RPC URL and return the new Web3 instance.
+
+        Thread-safe: protected by an internal lock so concurrent callers
+        cannot interleave index bumps.
+        """
+        with self._lock:
+            if len(self.urls) < 2:
+                raise RuntimeError("Only one RPC URL configured; cannot switch.")
+            self._index = (self._index + 1) % len(self.urls)
+            url = self.urls[self._index]
+            self.log_fn(f"\n⚠️  Switching to RPC URL {self._index + 1}/{len(self.urls)}: {url[:50]}...")
+            self._w3 = Web3(Web3.HTTPProvider(url))
+            if not self._w3.is_connected():
+                raise ConnectionError(f"Failed to connect to RPC URL {self._index + 1}")
+            return self._w3
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +338,177 @@ class CurveLoanGetter:
                 self.coins.append({"address": address, "symbol": symbol, "decimals": decimals})
             except Exception:
                 break
+
+    def fetch_block_data(self, block_number: int, w3: Web3 | None = None,
+                         max_retries: int = 6) -> dict:
+        """Fetch all loan data for a single block. Thread-safe.
+
+        When *w3* is provided (parallel mode), uses it directly with
+        retry + exponential backoff — no RPC switching.  When *w3* is
+        ``None``, falls back to ``rpc_manager.w3``.
+        """
+        _w3 = w3 if w3 is not None else (
+            self.rpc_manager.w3 if self.rpc_manager else self.w3)
+        user_address = self.user_address
+        last_error = None
+
+        for attempt in range(max_retries):
+            try:
+                # 1. Block timestamp
+                block_time = _w3.eth.get_block(block_number)['timestamp']
+                block_date = datetime.fromtimestamp(
+                    block_time, tz=timezone.utc
+                ).strftime('%Y-%m-%d %H:%M:%S')
+
+                # 2. Multicall for all loan state
+                mc = W3Multicall(_w3)
+
+                llamma_calls = [
+                    ("price_oracle", "price_oracle()(uint256)"),
+                    ("get_base_price", "get_base_price()(uint256)"),
+                    ("active_band", "active_band()(int256)"),
+                    ("read_user_tick_numbers",
+                     "read_user_tick_numbers(address)(int128[2])",
+                     (user_address,)),
+                    ("band_balances",
+                     "get_xy(address)(uint256[][2])", (user_address,)),
+                ]
+                controller_calls = [
+                    ("health_full",
+                     "health(address,bool)(int256)", (user_address, True)),
+                    ("health_not_full",
+                     "health(address,bool)(int256)", (user_address, False)),
+                    ("debt", "debt(address)(uint256)", (user_address,)),
+                    ("user_state",
+                     "user_state(address)(uint256[4])", (user_address,)),
+                ]
+
+                for call in llamma_calls:
+                    if len(call) == 2:
+                        _, sig = call
+                        mc.add(W3Multicall.Call(
+                            self.llamma_address, sig, ()))
+                    else:
+                        _, sig, args = call
+                        mc.add(W3Multicall.Call(
+                            self.llamma_address, sig, args))
+                for call in controller_calls:
+                    if len(call) == 2:
+                        _, sig = call
+                        mc.add(W3Multicall.Call(
+                            self.controller_address, sig, ()))
+                    else:
+                        _, sig, args = call
+                        mc.add(W3Multicall.Call(
+                            self.controller_address, sig, args))
+
+                results = mc.call(block_identifier=block_number)
+
+                # 3. Parse multicall results
+                raw = {}
+                for (attr, *_), value in zip(
+                        llamma_calls + controller_calls, results):
+                    raw[attr] = value
+
+                # 4. Compute bands (pure computation)
+                bands = self._compute_bands_static(
+                    raw['read_user_tick_numbers'], raw['band_balances'],
+                    raw['get_base_price'], self.A, self.coins)
+
+                # 5. Build output dict
+                price_oracle = raw['price_oracle'] / 1e18
+                health = raw['health_full'] / PRECISION * 100
+                debt = raw['debt'] / PRECISION
+                collateral_native = 0
+                collateral_crvusd = 0
+
+                user_state = raw.get('user_state')
+                if user_state:
+                    try:
+                        collateral_native = (user_state[0]
+                                             / (10 ** self.coins[1]['decimals']))
+                        collateral_crvusd = user_state[1] / 1e18
+                        debt = user_state[2] / 1e18
+                    except Exception:
+                        pass
+
+                total_collateral_value = (collateral_native * price_oracle
+                                          + collateral_crvusd)
+                if total_collateral_value == 0 and bands:
+                    band_collateral_value = sum(
+                        b.get('collateral_as_crvusd', 0) for b in bands)
+                    band_crvusd_value = sum(
+                        b.get('crvusd_amount', 0) for b in bands)
+                    total_collateral_value = (band_collateral_value
+                                              + band_crvusd_value)
+                    collateral_crvusd = band_crvusd_value
+
+                return {
+                    'block': block_number,
+                    'block_date': block_date,
+                    'price_oracle': price_oracle,
+                    'health': health,
+                    'get_base_price': raw['get_base_price'],
+                    'A': self.A,
+                    'bands': bands,
+                    'debt': debt,
+                    'total_collateral_value': total_collateral_value,
+                    'collateral_native': collateral_native,
+                    'collateral_crvusd': collateral_crvusd,
+                    'num_bands_state': len(bands),
+                }
+
+            except BlockNotFound:
+                raise
+            except Exception as e:
+                last_error = e
+                if attempt == max_retries - 1:
+                    raise
+                if is_rate_limit_error(e):
+                    backoff = (2 ** attempt) + random.uniform(0, 1)
+                else:
+                    backoff = 2 ** attempt
+                time.sleep(backoff)
+
+        raise last_error  # unreachable but satisfies type checkers
+
+    @staticmethod
+    def _compute_bands_static(read_user_tick_numbers, band_balances,
+                              get_base_price, A, coins) -> List[dict]:
+        """Compute band data from raw multicall results. Pure function."""
+        assert coins[0]['symbol'] == 'crvUSD', "Expected first coin to be crvUSD"
+
+        first_user_band, last_user_band = read_user_tick_numbers
+        base_price = get_base_price / float(PRECISION)
+        k = (A - 1) / A
+        bands = []
+
+        for i, band_num in enumerate(
+                range(first_user_band, last_user_band + 1)):
+            max_price = base_price * (k ** band_num)
+            min_price = base_price * (k ** (band_num + 1))
+            band_width = max_price - min_price
+            avg_price = (min_price + max_price) / 2
+            crvusd_amount = band_balances[0][i] / PRECISION
+            collateral_amount = (band_balances[1][i]
+                                 / (10 ** coins[1]['decimals']))
+            collateral_value = collateral_amount * avg_price
+            total_value_for_bars = collateral_value + crvusd_amount
+
+            bands.append({
+                "band_num": band_num,
+                "min_price": min_price,
+                "max_price": max_price,
+                "avg_price": avg_price,
+                "band_width": band_width,
+                "crvusd_amount": crvusd_amount,
+                "collateral_amount": collateral_amount,
+                "collateral_as_crvusd": collateral_value,
+                "total_collateral_value": collateral_value,
+                "band_total_value": total_value_for_bars,
+            })
+
+        return bands
 
     def band_max_price(self, n: int) -> float:
         """Calculates the top of the range of the nth band."""
